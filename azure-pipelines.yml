@@ -1,0 +1,92 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - infra/**
+      - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - infra/**
+      - azure-pipelines.yml
+
+variables:
+  - name: TF_VERSION
+    value: 1.13.5
+  - name: TF_ROOT
+    value: infra
+
+stages:
+  - stage: Validate
+    displayName: Validate Terraform
+    jobs:
+      - job: Validate
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+          - script: terraform fmt -check -recursive
+            workingDirectory: $(TF_ROOT)
+            displayName: Check formatting
+          - script: |
+              terraform init -backend=false -input=false
+              terraform validate
+            workingDirectory: $(TF_ROOT)
+            displayName: Initialize and validate
+
+  - stage: Deploy
+    displayName: Plan and apply
+    dependsOn: Validate
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: Apply
+        displayName: Apply Terraform
+        environment: GenAI-Test-Production
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+                - task: AzureCLI@2
+                  displayName: Check image, plan, and apply
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    workingDirectory: $(TF_ROOT)
+                    inlineScript: |
+                      set -euo pipefail
+                      az vm image show \
+                        --location eastus \
+                        --urn "MicrosoftWindowsDesktop:Windows-11:${WINDOWS_IMAGE_SKU:-win11-25h2-ent}:latest" \
+                        --output none
+                      terraform init -input=false \
+                        -backend-config="resource_group_name=$TF_STATE_RESOURCE_GROUP" \
+                        -backend-config="storage_account_name=$TF_STATE_STORAGE_ACCOUNT" \
+                        -backend-config="container_name=$TF_STATE_CONTAINER" \
+                        -backend-config="key=$TF_STATE_KEY" \
+                        -backend-config="use_azuread_auth=true" \
+                        -backend-config="use_cli=true"
+                      terraform plan -input=false -out=tfplan
+                      terraform apply -input=false -auto-approve tfplan
+                  env:
+                    ARM_USE_CLI: "true"
+                    ARM_USE_AZUREAD: "true"
+                    ARM_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+                    TF_VAR_subscription_id: $(AZURE_SUBSCRIPTION_ID)
+                    TF_VAR_admin_password: $(VM_ADMIN_PASSWORD)
+                    TF_IN_AUTOMATION: "true"
