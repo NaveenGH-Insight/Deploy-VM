@@ -1,48 +1,46 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $mediaUrl = '${sql_media_url}'
-$trustedRanges = ${trusted_firewall_ranges}
+$trustedRanges = ConvertFrom-Json -InputObject '${trusted_firewall_ranges}'
+$sqlTcpPort = '${sql_tcp_port}'
 $workDir = 'C:\AzureData\SqlExpress2022'
 $installer = Join-Path $workDir 'SQLEXPR_x64_ENU.exe'
 $mediaDir = Join-Path $workDir 'media'
 
 New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
-if (Get-Service -Name 'MSSQL$SQLEXPRESS' -ErrorAction SilentlyContinue) {
-    Write-Output 'SQL Server Express instance already exists; skipping installation.'
-    exit 0
-}
+if (-not (Get-Service -Name 'MSSQL$SQLEXPRESS' -ErrorAction SilentlyContinue)) {
+    Invoke-WebRequest -Uri $mediaUrl -OutFile $installer -UseBasicParsing
+    $signature = Get-AuthenticodeSignature -FilePath $installer
+    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+        throw "SQL Server media signature check failed: $($signature.Status)"
+    }
 
-Invoke-WebRequest -Uri $mediaUrl -OutFile $installer -UseBasicParsing
-$signature = Get-AuthenticodeSignature -FilePath $installer
-if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
-    throw "SQL Server media signature check failed: $($signature.Status)"
-}
+    New-Item -ItemType Directory -Path $mediaDir -Force | Out-Null
+    $extract = Start-Process -FilePath $installer -ArgumentList @('/Q', "/x:$mediaDir") -Wait -PassThru
+    if ($extract.ExitCode -ne 0) {
+        throw "SQL Server Express media extraction failed with exit code $($extract.ExitCode)."
+    }
 
-New-Item -ItemType Directory -Path $mediaDir -Force | Out-Null
-$extract = Start-Process -FilePath $installer -ArgumentList @('/Q', "/x:$mediaDir") -Wait -PassThru
-if ($extract.ExitCode -ne 0) {
-    throw "SQL Server Express media extraction failed with exit code $($extract.ExitCode)."
-}
+    $setup = Get-ChildItem -Path $mediaDir -Filter 'setup.exe' -Recurse |
+        Select-Object -First 1 -ExpandProperty FullName
+    if (-not $setup) {
+        throw "setup.exe was not found in the extracted SQL Server Express media."
+    }
 
-$setup = Get-ChildItem -Path $mediaDir -Filter 'setup.exe' -Recurse |
-    Select-Object -First 1 -ExpandProperty FullName
-if (-not $setup) {
-    throw "setup.exe was not found in the extracted SQL Server Express media."
-}
-
-$arguments = @(
-    '/Q',
-    '/ACTION=Install',
-    '/FEATURES=SQL',
-    '/INSTANCENAME=SQLEXPRESS',
-    '/IACCEPTSQLSERVERLICENSETERMS',
-    '/SQLSYSADMINACCOUNTS="BUILTIN\Administrators"',
-    '/TCPENABLED=1'
-)
-$install = Start-Process -FilePath $setup -ArgumentList $arguments -Wait -PassThru
-if ($install.ExitCode -notin @(0, 3010)) {
-    throw "SQL Server Express setup failed with exit code $($install.ExitCode)."
+    $arguments = @(
+        '/Q',
+        '/ACTION=Install',
+        '/FEATURES=SQL',
+        '/INSTANCENAME=SQLEXPRESS',
+        '/IACCEPTSQLSERVERLICENSETERMS',
+        '/SQLSYSADMINACCOUNTS="BUILTIN\Administrators"',
+        '/TCPENABLED=1'
+    )
+    $install = Start-Process -FilePath $setup -ArgumentList $arguments -Wait -PassThru
+    if ($install.ExitCode -notin @(0, 3010)) {
+        throw "SQL Server Express setup failed with exit code $($install.ExitCode)."
+    }
 }
 
 $tcpKey = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL16.SQLEXPRESS\MSSQLServer\SuperSocketNetLib\Tcp'
@@ -52,11 +50,11 @@ if (-not (Test-Path $tcpKey)) {
 Set-ItemProperty -Path $tcpKey -Name Enabled -Value 1
 $ipAll = Join-Path $tcpKey 'IPAll'
 Set-ItemProperty -Path $ipAll -Name TcpDynamicPorts -Value ''
-Set-ItemProperty -Path $ipAll -Name TcpPort -Value '1433'
+Set-ItemProperty -Path $ipAll -Name TcpPort -Value $sqlTcpPort
 
-if (-not (Get-NetFirewallRule -DisplayName 'SQL Server Express TCP 1433' -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName 'SQL Server Express TCP 1433' `
-        -Direction Inbound -Protocol TCP -LocalPort 1433 `
+if (-not (Get-NetFirewallRule -DisplayName "SQL Server Express TCP $sqlTcpPort" -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -DisplayName "SQL Server Express TCP $sqlTcpPort" `
+        -Direction Inbound -Protocol TCP -LocalPort $sqlTcpPort `
         -RemoteAddress $trustedRanges -Action Allow -Profile Any | Out-Null
 }
 
@@ -65,4 +63,4 @@ Get-Service -Name 'MSSQL$SQLEXPRESS' |
     Where-Object Status -ne 'Running' |
     ForEach-Object { throw 'SQL Server Express service did not start.' }
 
-Write-Output 'SQL Server 2022 Express installed; TCP is configured on port 1433.'
+Write-Output "SQL Server Express is installed; TCP is configured on port $sqlTcpPort."

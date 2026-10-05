@@ -30,6 +30,7 @@ locals {
   sql_install_script = templatefile("${path.module}/scripts/install-sql.ps1.tftpl", {
     sql_media_url           = var.sql_media_url
     trusted_firewall_ranges = jsonencode(local.trusted_firewall_ranges)
+    sql_tcp_port            = var.sql_tcp_port
   })
 }
 
@@ -99,13 +100,13 @@ resource "azurerm_network_security_rule" "rdp_from_private_networks" {
 }
 
 resource "azurerm_network_security_rule" "sql_from_private_networks" {
-  name                        = "Allow-SQL-From-VNet"
+  name                        = "Allow-SQL-${var.sql_tcp_port}-From-VNet"
   priority                    = 110
   direction                   = "Inbound"
   access                      = "Allow"
   protocol                    = "Tcp"
   source_port_range           = "*"
-  destination_port_range      = "1433"
+  destination_port_range      = tostring(var.sql_tcp_port)
   source_address_prefix       = "VirtualNetwork"
   destination_address_prefix  = "*"
   resource_group_name         = data.azurerm_resource_group.target.name
@@ -152,6 +153,7 @@ resource "azurerm_windows_virtual_machine" "vm" {
   size                = var.vm_size
   admin_username      = var.admin_username
   admin_password      = var.admin_password
+  license_type        = "Windows_Client"
   network_interface_ids = [
     azurerm_network_interface.vm.id,
   ]
@@ -162,8 +164,8 @@ resource "azurerm_windows_virtual_machine" "vm" {
   os_disk {
     name                 = "${local.name_prefix}-os"
     caching              = "ReadWrite"
-    storage_account_type = "StandardSSD_LRS"
-    disk_size_gb         = 128
+    storage_account_type = var.os_disk_storage_account_type
+    disk_size_gb         = var.os_disk_size_gb
   }
 
   source_image_reference {

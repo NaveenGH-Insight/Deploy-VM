@@ -1,35 +1,45 @@
 variable "subscription_id" {
-  description = "Azure subscription ID that contains the existing resource group."
+  description = "Azure subscription ID for deployment."
   type        = string
-  default     = "3e3f5f63-438b-4205-b50e-df27fa676994"
 }
 
 variable "resource_group_name" {
-  description = "Existing resource group where the VM and network resources will be created."
+  description = "Existing resource group where resources will be created."
   type        = string
-  default     = "GenAI-Test"
 }
 
 variable "vm_name" {
-  description = "Name for the Windows VM and related resources."
+  description = "Base name for the Windows VM and related resources."
   type        = string
-  default     = "genai-sql-win11-vm"
+
+  validation {
+    condition     = length(var.vm_name) <= 64 && can(regex("^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$", var.vm_name))
+    error_message = "vm_name must be 1-64 characters, contain only letters, digits, and hyphens, and start/end with a letter or digit."
+  }
 }
 
 variable "vm_size" {
   description = "Azure VM size."
   type        = string
-  default     = "Standard_D2s_v5"
+}
+
+variable "os_disk_storage_account_type" {
+  description = "Managed OS disk storage SKU supported in the target region."
+  type        = string
+}
+
+variable "os_disk_size_gb" {
+  description = "Managed OS disk size in GiB; must meet the selected image's minimum."
+  type        = number
 }
 
 variable "admin_username" {
   description = "Local Windows administrator account name."
   type        = string
-  default     = "azureadmin"
 }
 
 variable "admin_password" {
-  description = "Strong password for the local Windows administrator. Supply through TF_VAR_admin_password."
+  description = "Strong local Windows administrator password. Supply through a CI secret as TF_VAR_admin_password."
   type        = string
   sensitive   = true
   nullable    = false
@@ -41,25 +51,22 @@ variable "admin_password" {
 }
 
 variable "vnet_address_space" {
-  description = "Private address space for the new VNet."
+  description = "Non-overlapping private address space for the new VNet."
   type        = list(string)
-  default     = ["10.50.0.0/16"]
 }
 
 variable "subnet_address_prefix" {
   description = "Subnet prefix for the Windows VM."
   type        = string
-  default     = "10.50.1.0/24"
 }
 
 variable "vpn_client_address_prefixes" {
   description = "Optional VPN client CIDRs to allow through Windows Defender Firewall; the NSG already allows Azure's VirtualNetwork service tag."
   type        = list(string)
-  default     = []
 }
 
 variable "windows_image_publisher" {
-  description = "Windows client image publisher."
+  description = "Marketplace publisher for the Windows client image."
   type        = string
   default     = "MicrosoftWindowsDesktop"
 }
@@ -71,29 +78,32 @@ variable "windows_image_offer" {
 }
 
 variable "windows_image_sku" {
-  description = "Windows 11 Enterprise marketplace SKU; confirm it is visible to this subscription before applying."
+  description = "Windows 11 Marketplace SKU available to the target subscription and region."
   type        = string
-  default     = "win11-25h2-ent"
 }
 
 variable "windows_image_version" {
-  description = "Marketplace image version. latest keeps the image patched at deployment time."
+  description = "Marketplace image version; latest selects the current published version."
   type        = string
-  default     = "latest"
 }
 
 variable "sql_media_url" {
-  description = "Version-pinned Microsoft SQL Server 2022 Express media URL."
+  description = "Microsoft SQL Server 2022 Express media URL."
   type        = string
   default     = "https://download.microsoft.com/download/3/8/d/38de7036-2433-4207-8eae-06e247e17b25/SQLEXPR_x64_ENU.exe"
 }
 
-variable "tags" {
-  description = "Tags applied to resources created by this project."
-  type        = map(string)
-  default = {
-    workload    = "sql-express-devtest"
-    managed_by  = "terraform"
-    environment = "devtest"
+variable "sql_tcp_port" {
+  description = "Static TCP port for the SQL Server Express instance."
+  type        = number
+
+  validation {
+    condition     = var.sql_tcp_port >= 1 && var.sql_tcp_port <= 65535
+    error_message = "sql_tcp_port must be between 1 and 65535."
   }
+}
+
+variable "tags" {
+  description = "Environment-specific tags applied to created resources."
+  type        = map(string)
 }

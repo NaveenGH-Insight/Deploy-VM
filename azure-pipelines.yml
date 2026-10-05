@@ -1,3 +1,17 @@
+parameters:
+  - name: deploy
+    displayName: Deploy after validation
+    type: boolean
+    default: false
+  - name: variableGroup
+    displayName: Azure and Terraform variable group
+    type: string
+    default: terraform-target
+  - name: deploymentEnvironment
+    displayName: Protected deployment environment
+    type: string
+    default: terraform-deployment
+
 trigger:
   branches:
     include:
@@ -6,6 +20,7 @@ trigger:
     include:
       - infra/**
       - azure-pipelines.yml
+      - README.md
 
 pr:
   branches:
@@ -15,6 +30,7 @@ pr:
     include:
       - infra/**
       - azure-pipelines.yml
+      - README.md
 
 variables:
   - name: TF_VERSION
@@ -24,7 +40,7 @@ variables:
 
 stages:
   - stage: Validate
-    displayName: Validate Terraform
+    displayName: Format and validate Terraform
     jobs:
       - job: Validate
         pool:
@@ -38,6 +54,7 @@ stages:
             workingDirectory: $(TF_ROOT)
             displayName: Check formatting
           - script: |
+              set -euo pipefail
               terraform init -backend=false -input=false
               terraform validate
             workingDirectory: $(TF_ROOT)
@@ -46,11 +63,13 @@ stages:
   - stage: Deploy
     displayName: Plan and apply
     dependsOn: Validate
-    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    condition: and(succeeded(), ${{ eq(parameters.deploy, true) }}, eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    variables:
+      - group: ${{ parameters.variableGroup }}
     jobs:
       - deployment: Apply
         displayName: Apply Terraform
-        environment: GenAI-Test-Production
+        environment: ${{ parameters.deploymentEnvironment }}
         pool:
           vmImage: ubuntu-latest
         strategy:
@@ -70,9 +89,34 @@ stages:
                     workingDirectory: $(TF_ROOT)
                     inlineScript: |
                       set -euo pipefail
+                      require_value() {
+                        local name="$1"
+                        local value="${!name:-}"
+                        if [[ -z "$value" || "$value" == *'$('* ]]; then
+                          echo "Required variable is missing or unresolved in the selected variable group: $name"
+                          exit 1
+                        fi
+                      }
+                      for name in AZURE_SUBSCRIPTION_ID \
+                        TF_VAR_resource_group_name TF_VAR_vm_name TF_VAR_vm_size \
+                        TF_VAR_os_disk_storage_account_type TF_VAR_os_disk_size_gb \
+                        TF_VAR_admin_username TF_VAR_admin_password \
+                        TF_VAR_windows_image_sku TF_VAR_windows_image_version \
+                        TF_VAR_vnet_address_space TF_VAR_subnet_address_prefix \
+                        TF_VAR_vpn_client_address_prefixes TF_VAR_tags TF_VAR_sql_tcp_port \
+                        TF_STATE_RESOURCE_GROUP TF_STATE_STORAGE_ACCOUNT \
+                        TF_STATE_CONTAINER TF_STATE_KEY; do
+                        require_value "$name"
+                      done
+                      az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+                      location="$(az group show --name "$TF_VAR_resource_group_name" --query location --output tsv)"
+                      if [[ -z "$location" ]]; then
+                        echo "Configured resource group was not found or has no location."
+                        exit 1
+                      fi
                       az vm image show \
-                        --location eastus \
-                        --urn "MicrosoftWindowsDesktop:Windows-11:${WINDOWS_IMAGE_SKU:-win11-25h2-ent}:latest" \
+                        --location "$location" \
+                        --urn "MicrosoftWindowsDesktop:Windows-11:${TF_VAR_windows_image_sku}:${TF_VAR_windows_image_version}" \
                         --output none
                       terraform init -input=false \
                         -backend-config="resource_group_name=$TF_STATE_RESOURCE_GROUP" \
@@ -84,9 +128,27 @@ stages:
                       terraform plan -input=false -out=tfplan
                       terraform apply -input=false -auto-approve tfplan
                   env:
+                    AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
                     ARM_USE_CLI: "true"
                     ARM_USE_AZUREAD: "true"
                     ARM_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
                     TF_VAR_subscription_id: $(AZURE_SUBSCRIPTION_ID)
-                    TF_VAR_admin_password: $(VM_ADMIN_PASSWORD)
+                    TF_VAR_resource_group_name: $(TF_VAR_resource_group_name)
+                    TF_VAR_vm_name: $(TF_VAR_vm_name)
+                    TF_VAR_vm_size: $(TF_VAR_vm_size)
+                    TF_VAR_os_disk_storage_account_type: $(TF_VAR_os_disk_storage_account_type)
+                    TF_VAR_os_disk_size_gb: $(TF_VAR_os_disk_size_gb)
+                    TF_VAR_admin_username: $(TF_VAR_admin_username)
+                    TF_VAR_admin_password: $(TF_VAR_admin_password)
+                    TF_VAR_windows_image_sku: $(TF_VAR_windows_image_sku)
+                    TF_VAR_windows_image_version: $(TF_VAR_windows_image_version)
+                    TF_VAR_vnet_address_space: $(TF_VAR_vnet_address_space)
+                    TF_VAR_subnet_address_prefix: $(TF_VAR_subnet_address_prefix)
+                    TF_VAR_vpn_client_address_prefixes: $(TF_VAR_vpn_client_address_prefixes)
+                    TF_VAR_tags: $(TF_VAR_tags)
+                    TF_VAR_sql_tcp_port: $(TF_VAR_sql_tcp_port)
+                    TF_STATE_RESOURCE_GROUP: $(TF_STATE_RESOURCE_GROUP)
+                    TF_STATE_STORAGE_ACCOUNT: $(TF_STATE_STORAGE_ACCOUNT)
+                    TF_STATE_CONTAINER: $(TF_STATE_CONTAINER)
+                    TF_STATE_KEY: $(TF_STATE_KEY)
                     TF_IN_AUTOMATION: "true"

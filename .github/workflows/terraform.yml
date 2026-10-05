@@ -1,20 +1,29 @@
-name: Terraform deployment
+name: Terraform
 
 on:
   pull_request:
     paths:
       - "infra/**"
       - ".github/workflows/terraform.yml"
-  push:
-    branches:
-      - main
-    paths:
-      - "infra/**"
-      - ".github/workflows/terraform.yml"
+      - "README.md"
   workflow_dispatch:
+    inputs:
+      target_environment:
+        description: GitHub Environment containing this target's Azure credentials and configuration
+        required: true
+        type: environment
+      deploy:
+        description: Plan and apply the infrastructure (requires environment approval if configured)
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
+
+concurrency:
+  group: terraform-${{ inputs.target_environment || github.event.pull_request.base.ref }}
+  cancel-in-progress: false
 
 jobs:
   validate:
@@ -34,13 +43,14 @@ jobs:
 
   deploy:
     name: Plan and apply
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.deploy
     needs: validate
     runs-on: ubuntu-latest
-    environment: production
+    environment: ${{ inputs.target_environment }}
     permissions:
       contents: read
       id-token: write
+    timeout-minutes: 120
     defaults:
       run:
         working-directory: infra
@@ -51,28 +61,66 @@ jobs:
       ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      TF_VAR_admin_password: ${{ secrets.VM_ADMIN_PASSWORD }}
+      TF_VAR_resource_group_name: ${{ vars.TF_VAR_RESOURCE_GROUP_NAME }}
+      TF_VAR_vm_name: ${{ vars.TF_VAR_VM_NAME }}
+      TF_VAR_vm_size: ${{ vars.TF_VAR_VM_SIZE }}
+      TF_VAR_os_disk_storage_account_type: ${{ vars.TF_VAR_OS_DISK_STORAGE_ACCOUNT_TYPE }}
+      TF_VAR_os_disk_size_gb: ${{ vars.TF_VAR_OS_DISK_SIZE_GB }}
+      TF_VAR_admin_username: ${{ vars.TF_VAR_ADMIN_USERNAME }}
+      TF_VAR_admin_password: ${{ secrets.TF_VAR_ADMIN_PASSWORD }}
+      TF_VAR_windows_image_sku: ${{ vars.TF_VAR_WINDOWS_IMAGE_SKU }}
+      TF_VAR_windows_image_version: ${{ vars.TF_VAR_WINDOWS_IMAGE_VERSION }}
+      TF_VAR_vnet_address_space: ${{ vars.TF_VAR_VNET_ADDRESS_SPACE }}
+      TF_VAR_subnet_address_prefix: ${{ vars.TF_VAR_SUBNET_ADDRESS_PREFIX }}
+      TF_VAR_vpn_client_address_prefixes: ${{ vars.TF_VAR_VPN_CLIENT_ADDRESS_PREFIXES }}
+      TF_VAR_tags: ${{ vars.TF_VAR_TAGS }}
+      TF_VAR_sql_tcp_port: ${{ vars.TF_VAR_SQL_TCP_PORT }}
       TF_IN_AUTOMATION: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.13.5
+      - name: Check required environment configuration
+        shell: bash
+        env:
+          STATE_RESOURCE_GROUP: ${{ vars.TF_STATE_RESOURCE_GROUP }}
+          STATE_STORAGE_ACCOUNT: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+          STATE_CONTAINER: ${{ vars.TF_STATE_CONTAINER }}
+          STATE_KEY: ${{ vars.TF_STATE_KEY }}
+        run: |
+          set -euo pipefail
+          for name in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID \
+            TF_VAR_resource_group_name TF_VAR_vm_name TF_VAR_vm_size \
+            TF_VAR_os_disk_storage_account_type TF_VAR_os_disk_size_gb \
+            TF_VAR_admin_username TF_VAR_admin_password TF_VAR_windows_image_sku \
+            TF_VAR_windows_image_version \
+            TF_VAR_vnet_address_space TF_VAR_subnet_address_prefix \
+            TF_VAR_vpn_client_address_prefixes TF_VAR_tags TF_VAR_sql_tcp_port \
+            STATE_RESOURCE_GROUP STATE_STORAGE_ACCOUNT STATE_CONTAINER STATE_KEY; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required GitHub Environment secret/variable is missing: $name"
+              exit 1
+            fi
+          done
       - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - name: Check Windows 11 image availability
-        env:
-          IMAGE_PUBLISHER: MicrosoftWindowsDesktop
-          IMAGE_OFFER: Windows-11
-          IMAGE_SKU: ${{ vars.WINDOWS_IMAGE_SKU || 'win11-25h2-ent' }}
-          AZURE_LOCATION: eastus
+      - name: Verify target resource group and Windows image
+        shell: bash
         run: |
+          set -euo pipefail
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+          location="$(az group show --name "$TF_VAR_resource_group_name" --query location --output tsv)"
+          if [[ -z "$location" ]]; then
+            echo "::error::The configured resource group was not found or has no location."
+            exit 1
+          fi
           az vm image show \
-            --location "$AZURE_LOCATION" \
-            --urn "$IMAGE_PUBLISHER:$IMAGE_OFFER:$IMAGE_SKU:latest" \
+            --location "$location" \
+            --urn "MicrosoftWindowsDesktop:Windows-11:${TF_VAR_windows_image_sku}:${TF_VAR_windows_image_version}" \
             --output none
       - name: Initialize remote state
         env:
@@ -80,7 +128,9 @@ jobs:
           STATE_STORAGE_ACCOUNT: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
           STATE_CONTAINER: ${{ vars.TF_STATE_CONTAINER }}
           STATE_KEY: ${{ vars.TF_STATE_KEY }}
+        shell: bash
         run: |
+          set -euo pipefail
           terraform init -input=false \
             -backend-config="resource_group_name=$STATE_RESOURCE_GROUP" \
             -backend-config="storage_account_name=$STATE_STORAGE_ACCOUNT" \

@@ -1,123 +1,147 @@
-# Windows 11 + SQL Server Express 2022 on Azure
+# Reusable Windows 11 + SQL Server Express Azure deployment
 
-Terraform and CI/CD starter project for a **private Windows 11 dev/test VM** running SQL Server Express 2022 in the existing `GenAI-Test` resource group.
+Terraform provisions an existing-resource-group deployment of a private Windows 11 VM and installs SQL Server Express 2022. Use the same Terraform configuration from GitHub Actions or Azure DevOps by supplying each target environment's values through protected environment variables and secrets.
 
-| Setting | Default |
-| --- | --- |
-| Subscription | `3e3f5f63-438b-4205-b50e-df27fa676994` |
-| Resource group | `GenAI-Test` (must already exist) |
-| Region | Inherited from `GenAI-Test` |
-| VM | `genai-sql-win11-vm`, `Standard_D2s_v5` |
-| Windows image | Microsoft Windows 11 Enterprise Marketplace image; SKU is configurable |
-| VNet / subnet | `10.50.0.0/16` / `10.50.1.0/24` |
-| SQL instance | `SQLEXPRESS`, TCP port `1433`, Windows authentication |
+This repository contains **no subscription IDs, resource-group names, passwords, state-account names, network CIDRs, VM sizes, or Marketplace image SKU/version defaults**. Set them in the CI environment. The only location is discovered from the configured existing resource group, so the VM, networking and image availability check use that resource group's region.
 
-This project creates only its VM, managed OS disk, NIC, dedicated VNet/subnet, NSG, NAT Gateway and public egress IP, plus the VM run-command operation. It does **not** create, import, or manage the resource group or the existing Cognitive Services resources. There is no public IP on the VM and no public inbound RDP or SQL rule. Private-network sources can connect on RDP/3389 and SQL/1433.
+## What Terraform creates
 
-## Important before deployment
+- One Windows 11 VM, managed OS disk, and NIC in the existing resource group.
+- A dedicated VNet and subnet, NSG rules allowing RDP/3389 and SQL/1433 only from the Azure `VirtualNetwork` service tag, and a deny rule for other inbound traffic.
+- A NAT Gateway and static public IP for outbound downloads and updates. The VM itself has no public IP; inbound RDP and SQL are not exposed to the internet.
+- An Azure VM Run Command that verifies Microsoft's SQL media signature, installs SQL Server Express 2022, enables TCP, sets the configured port, and opens the guest firewall only for the private VNet/VPN address ranges.
 
-- This Windows 11 client image is intended for Visual Studio subscription **development/test** use. Confirm the subscription has the applicable Windows client image entitlement before deploying; this project does not grant production Windows virtualization rights.
-- The image SKU varies by release and subscription access. The default `win11-25h2-ent` is a starting point, not a verified entitlement for every subscription. The pipeline checks that the selected East US image is visible before Terraform runs. If it fails, list available SKUs with `az vm image list-skus --location eastus --publisher MicrosoftWindowsDesktop --offer Windows-11 --output table` and set `WINDOWS_IMAGE_SKU` (GitHub Actions) or `WINDOWS_IMAGE_SKU` (Azure DevOps) to an available SKU.
-- The first deployment downloads roughly 280 MB of SQL media onto the VM. A NAT Gateway and static public IP are included for explicit outbound access, required for SQL media download and Windows updates on the private subnet. They add ongoing hourly and data-processing costs beyond the VM and disk; check current regional pricing before applying.
-- `Standard_D2s_v5` is a modest dev/test size. Resize it for larger databases or concurrent workloads.
-- Terraform state contains the VM administrator password and other sensitive values. Use the private Azure Blob backend below; do not commit state files, plans, credentials, or `.tfvars`.
-- SQL Server Express is installed with Windows authentication only; the setup does not enable SQL authentication or install SSMS. Connect to `tcp:<private-ip>,1433` from a host routed to the VNet. Azure Bastion can provide RDP access, but SQL client traffic needs a VPN or another private route. If the VPN client pool is outside the VNet address range, set `vpn_client_address_prefixes` in Terraform so Windows Defender Firewall permits that client range.
+SQL Express uses Windows authentication and a fixed `SQLEXPRESS` instance. SSMS is not installed. Connect from a machine with a private route to the VNet. Windows client images are suitable only when the subscription has the appropriate dev/test entitlement; verify licensing and Marketplace access for each target subscription.
 
-## One-time Azure setup
+SQL Server Express has edition limits, including a maximum 10 GB size per relational database. Use a different SQL Server edition if a workload outgrows Express.
 
-### 1. Create the remote Terraform state storage
+NAT Gateway, public IP, VM compute and storage incur ongoing charges. Review regional pricing and configure cost controls before enabling deployment. Terraform state contains the VM administrator password; always use a private remote backend and protect access to it.
 
-Install Azure CLI, sign in interactively, then from this repository run:
+## Required configuration
+
+Use one independent remote-state key per environment. Do not share a state key between environments or between this configuration and unrelated Terraform deployments.
+
+### Terraform input variables
+
+| Input | Required | Description |
+|---|---:|---|
+| `subscription_id` | Yes | Target Azure subscription ID. |
+| `resource_group_name` | Yes | Existing resource group. Terraform does not create or delete it. |
+| `vm_name` | Yes | Alphanumeric/hyphen base name for this deployment's VM and related resources. |
+| `vm_size` | Yes | Azure VM size available in the target region/subscription. |
+| `os_disk_storage_account_type` | Yes | Managed OS disk SKU supported in the target environment. |
+| `os_disk_size_gb` | Yes | OS disk capacity in GiB, compatible with the selected image. |
+| `admin_username` | Yes | Local Windows administrator username. |
+| `admin_password` | Yes | Secret with at least 14 characters, upper/lowercase, digit and special character. |
+| `windows_image_sku` | Yes | Windows 11 Marketplace SKU visible and licensed for this subscription. |
+| `windows_image_version` | Yes | Available image version; use a specific version for repeatable builds or `latest` to follow the current image. |
+| `vnet_address_space` | Yes | JSON list of non-overlapping CIDRs, e.g. `["10.80.0.0/16"]`. |
+| `subnet_address_prefix` | Yes | Subnet CIDR contained by the VNet, e.g. `10.80.1.0/24`. |
+| `vpn_client_address_prefixes` | Yes | JSON CIDR list allowed by Windows Firewall; use `[]` when not using VPN clients. |
+| `tags` | Yes | JSON object of resource tags; use `{}` if no tags are required. |
+| `sql_tcp_port` | Yes | SQL TCP port, typically `1433`. |
+
+Marketplace publisher/offer and SQL Server Express installer URL identify the requested products. The deployment preflight checks the selected SKU/version in the resource group's region before running Terraform.
+
+Find current image values for a target subscription/region after authenticating the Azure CLI:
+
+```bash
+az vm image list-skus --location <resource-group-region> --publisher MicrosoftWindowsDesktop --offer Windows-11 --output table
+az vm image list --location <resource-group-region> --publisher MicrosoftWindowsDesktop --offer Windows-11 --sku <selected-sku> --all --output table
+```
+
+Use a SKU and version that your target subscription is entitled to deploy.
+
+### Remote Terraform state
+
+Create an Azure StorageV2 account and private blob container before CI deployment. The storage account can be in a separate state resource group, but the backend identity needs data-plane access to it. The state account is deliberately separate from the Terraform-managed application resources.
+
+The helper script creates the storage account/container only when absent and refuses to modify an existing account whose HTTPS/TLS/shared-key/public-blob settings do not match its required security settings:
 
 ```powershell
 az login
-.\scripts\bootstrap-state.ps1 -StorageAccountName <globally-unique-lowercase-name>
+.\scripts\bootstrap-state.ps1 `
+  -SubscriptionId <subscription-id> `
+  -ResourceGroupName <existing-state-resource-group> `
+  -Location <state-region> `
+  -StorageAccountName <globally-unique-lowercase-name> `
+  -ContainerName <private-container-name> `
+  -PublicNetworkAccess <Enabled-or-Disabled>
 ```
 
-The script uses the existing `GenAI-Test` group and creates a private `tfstate` blob container in a StorageV2 account with HTTPS-only, TLS 1.2+, and shared-key/blob-public access disabled. The account's public endpoint is reachable by hosted CI agents, but data access requires Azure AD authorization. Keep the state account and container; CI will use them for locking and state.
+The signed-in operator needs permission to create a storage account in that resource group and `Storage Blob Data Contributor` on the state account to create the container using Azure AD. Choose `Enabled` only when the CI runner is allowed to reach the public storage endpoint; data-plane access still requires Azure AD. For `Disabled`, use a self-hosted CI runner with private connectivity to the storage endpoint. The script does not change existing account settings.
 
-Container creation uses your signed-in Azure AD identity. If it fails with an authorization error, grant your operator identity `Storage Blob Data Contributor` on the new storage account, wait for role propagation, then rerun the script:
+Set these state-backend variables in the CI environment:
 
-```powershell
-$storageAccountId = az storage account show --name <storage-account-name> --resource-group GenAI-Test --query id --output tsv
-$operatorObjectId = az ad signed-in-user show --query id --output tsv
-az role assignment create --assignee-object-id $operatorObjectId --assignee-principal-type User --role "Storage Blob Data Contributor" --scope $storageAccountId
-```
+| Name | Meaning |
+|---|---|
+| `TF_STATE_RESOURCE_GROUP` | Resource group containing the state account. |
+| `TF_STATE_STORAGE_ACCOUNT` | Storage account name. |
+| `TF_STATE_CONTAINER` | Private blob container. |
+| `TF_STATE_KEY` | Unique state blob key for this environment. |
 
-This role assignment requires Owner or User Access Administrator permission at that scope. If you lack it, ask an administrator to create the container or grant the role. The pipeline identity still needs its own Blob data role below.
+## GitHub Actions
 
-### 2. Configure workload identity federation
+1. Add `.github/workflows/terraform.yml` to the GitHub repository's default branch.
+2. Create a GitHub Environment for each deployment target (for example, a development or production environment). Add required reviewers/branch restrictions for environments that need approval.
+3. Configure an Entra federated credential for each GitHub Environment used for deployment:
+   - Issuer: `https://token.actions.githubusercontent.com`
+   - Subject: `repo:<OWNER>/<REPOSITORY>:environment:<GITHUB_ENVIRONMENT>`
+   - Audience: `api://AzureADTokenExchange`
+4. Add the following **Environment secrets**:
+   - `AZURE_CLIENT_ID`
+   - `AZURE_TENANT_ID`
+   - `AZURE_SUBSCRIPTION_ID`
+   - `TF_VAR_ADMIN_PASSWORD`
+5. Add the following **Environment variables**:
+   - `TF_VAR_RESOURCE_GROUP_NAME`
+   - `TF_VAR_VM_NAME`
+   - `TF_VAR_VM_SIZE`
+   - `TF_VAR_OS_DISK_STORAGE_ACCOUNT_TYPE`
+   - `TF_VAR_OS_DISK_SIZE_GB`
+   - `TF_VAR_ADMIN_USERNAME`
+   - `TF_VAR_WINDOWS_IMAGE_SKU`
+   - `TF_VAR_WINDOWS_IMAGE_VERSION`
+   - `TF_VAR_VNET_ADDRESS_SPACE`
+   - `TF_VAR_SUBNET_ADDRESS_PREFIX`
+   - `TF_VAR_VPN_CLIENT_ADDRESS_PREFIXES` (use `[]` if unused)
+   - `TF_VAR_TAGS` (use `{}` if unused)
+   - `TF_VAR_SQL_TCP_PORT`
+   - `TF_STATE_RESOURCE_GROUP`
+   - `TF_STATE_STORAGE_ACCOUNT`
+   - `TF_STATE_CONTAINER`
+   - `TF_STATE_KEY`
 
-Create an Entra application/service principal for the deployment identity and configure a federated credential:
+On pull requests, the workflow only runs Terraform formatting and validation. To deploy, use **Actions → Terraform → Run workflow** on the `main` branch, select the GitHub Environment, and explicitly set `deploy` to `true`. The environment's protection rules gate the job. The workflow checks the target resource group/image, initializes Azure Blob state, creates a saved Terraform plan, and applies that plan. The workflow has no push-to-deploy trigger.
 
-- **GitHub Actions:** issuer `https://token.actions.githubusercontent.com`, subject `repo:<OWNER>/<REPO>:environment:production`, audience `api://AzureADTokenExchange`. Create a GitHub environment named `production` and add required reviewers if you want an approval gate.
-- **Azure DevOps:** create an Azure Resource Manager service connection using workload identity federation. Protect the `GenAI-Test-Production` environment with approvals/checks before enabling the deployment stage.
+The deployment identity needs permission to read the target resource group, create/manage the VM and network resources, and execute the VM Run Command. A typical built-in-role starting point is `Reader`, `Virtual Machine Contributor`, and `Network Contributor` scoped to the target resource group, plus `Storage Blob Data Contributor` scoped to the state storage account. Confirm the exact operations against organization policy and provider behavior; prefer narrower custom role scopes when practical. Do not grant subscription-wide `Owner` solely for convenience.
 
-Give the deployment service principal the following roles:
+## Azure DevOps
 
-```powershell
-$subscription = "3e3f5f63-438b-4205-b50e-df27fa676994"
-$principalObjectId = "<service-principal-object-id>"
-$resourceGroupScope = "/subscriptions/$subscription/resourceGroups/GenAI-Test"
-$storageAccountId = az storage account show --name <storage-account-name> --resource-group GenAI-Test --query id --output tsv
+1. Import the repository and select `azure-pipelines.yml`.
+2. Install the **Terraform Installer** task extension if it is not already available to the organization.
+3. Create an Azure Resource Manager service connection using **workload identity federation**, targeting the desired subscription. Do not store a client secret in pipeline YAML.
+4. Create a pipeline variable group for the target environment and authorize this pipeline to use it. Set the same Terraform/backend variables listed above, plus `AZURE_SERVICE_CONNECTION` containing the service-connection name. Mark `TF_VAR_admin_password` secret.
+5. Create an Azure DevOps environment for this target and configure its approval/checks before allowing deployment.
+6. Queue the pipeline and select the matching variable group and protected environment. Enable **Deploy after validation** only when ready to deploy; its default is false. Pull requests and normal CI runs validate only.
 
-az role assignment create --assignee-object-id $principalObjectId --assignee-principal-type ServicePrincipal --role Reader --scope $resourceGroupScope
-az role assignment create --assignee-object-id $principalObjectId --assignee-principal-type ServicePrincipal --role "Virtual Machine Contributor" --scope $resourceGroupScope
-az role assignment create --assignee-object-id $principalObjectId --assignee-principal-type ServicePrincipal --role "Network Contributor" --scope $resourceGroupScope
-az role assignment create --assignee-object-id $principalObjectId --assignee-principal-type ServicePrincipal --role "Storage Blob Data Contributor" --scope $storageAccountId
-```
+The variable group must also define `TF_VAR_VPN_CLIENT_ADDRESS_PREFIXES` as JSON, `TF_VAR_TAGS` as JSON, and `TF_VAR_SQL_TCP_PORT`. Use `[]` and `{}` for the first two if unused. The service connection identity needs the same target-resource-group and state-storage roles described for GitHub Actions. Keep one variable group and state key per environment.
 
-The first three roles are scoped to the existing resource group because Terraform creates VM and networking resources there. This permits management of other resources in that group; use a custom role or narrower scopes if that is too broad. The Blob data role is scoped to the state storage account. The identity needs permission to create role assignments only if you choose to assign these roles yourself; Terraform does not create role assignments.
+## Local validation (no deployment)
 
-### 3. Set pipeline variables and secrets
-
-Use one pipeline system per deployment at a time; both share the same Terraform state.
-
-**GitHub Actions** (`Settings` → `Secrets and variables`):
-
-- Repository/environment secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `VM_ADMIN_PASSWORD`.
-- Repository/environment variables: `TF_STATE_RESOURCE_GROUP` (`GenAI-Test`), `TF_STATE_STORAGE_ACCOUNT`, `TF_STATE_CONTAINER` (`tfstate`), `TF_STATE_KEY` (`genai-test-sql-vm.tfstate`).
-- Optional variable: `WINDOWS_IMAGE_SKU` if the default image is not available.
-- Add required reviewers to the `production` environment to gate deployment. PRs only run formatting and validation; pushes to `main` and manual workflow dispatch can deploy.
-
-**Azure DevOps**:
-
-- Create pipeline variables `AZURE_SERVICE_CONNECTION`, `AZURE_SUBSCRIPTION_ID`, `TF_STATE_RESOURCE_GROUP`, `TF_STATE_STORAGE_ACCOUNT`, `TF_STATE_CONTAINER`, `TF_STATE_KEY`, and `VM_ADMIN_PASSWORD`. Mark `VM_ADMIN_PASSWORD` secret.
-- Optional variable `WINDOWS_IMAGE_SKU` if the default image is not available.
-- Create/protect the `GenAI-Test-Production` environment with the desired approval checks. The YAML runs format/validation on PRs and plans/applies after a non-PR run passes validation.
-
-Set the admin password as a secure secret/variable, not in source control. It must contain at least 14 characters including uppercase, lowercase, a digit and a special character.
-
-## Deploy
-
-Push the repository to GitHub and use Actions, or import it into Azure DevOps and run `azure-pipelines.yml`. Before the first CI run, complete the state and identity setup above. The deployment pipeline:
-
-1. Runs `terraform fmt -check` and `terraform validate`.
-2. Authenticates without a client secret (OIDC for GitHub; federated Azure service connection for Azure DevOps).
-3. Checks the selected Windows 11 image in East US.
-4. Initializes the private remote backend, creates a saved plan, and applies that exact plan.
-
-To validate locally without Azure or a remote backend:
+Install Terraform and run:
 
 ```powershell
-cd infra
+Set-Location infra
 terraform fmt -check -recursive
 terraform init -backend=false
 terraform validate
 ```
 
-`terraform validate` checks configuration/provider schema; it does not verify subscription Marketplace eligibility, policy compliance, quota, or deployment success. Do not run `terraform apply` locally unless you intentionally want to deploy.
+These checks do not contact or modify Azure. A successful `terraform validate` does not prove that the selected image SKU/license, regional quota, policy, or runtime installation is available in a target subscription. The CI deployment preflight checks the image, but a Terraform plan/apply is still required to verify deployment-time constraints.
 
-## Connect and verify
+## Outputs and cleanup
 
-After a successful apply, read the Terraform outputs for the VM private IP and SQL instance. From a machine with private network connectivity:
+Terraform outputs the VM ID, private IP, SQL endpoint name, and egress-only NAT IP. Use a VPN/private route or a separately managed private access solution to connect; never add public inbound RDP/SQL for convenience.
 
-- RDP to the private IP on port 3389.
-- Connect with a SQL client to `tcp:<private-ip>,1433`, instance `SQLEXPRESS`, using Windows authentication.
-- The VM's NAT public IP is **egress only** and must not be used for RDP or SQL connections.
-
-The SQL installation runs as an Azure VM Run Command after provisioning. A non-successful media download, signature check, extraction, or SQL setup exit code causes Terraform apply to fail rather than reporting a successful install.
-
-## Tear down
-
-`terraform destroy` removes only resources tracked in this project's state, not the resource group or unrelated resources. The state storage account is deliberately not managed by this Terraform configuration; delete it separately only after you are certain the state is no longer needed.
+`terraform destroy` deletes resources in this Terraform state. It does not delete the existing resource group or the separately managed state account. Review the plan carefully before any destroy operation.
